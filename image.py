@@ -202,7 +202,7 @@ class LoadImageFromPathEnhanced(LoadImageFromPath):
         _image_path_cache[str(image_path)] = str(image_path)
         
         return (image_tensor, mask, image)
-        
+
 # Middleware to handle clipspace file resolution
 @web.middleware
 async def clipspace_resolver_middleware(request, handler):
