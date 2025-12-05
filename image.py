@@ -7,12 +7,91 @@ import os
 import json
 import shutil
 
-from PIL import Image, ImageOps
+from PIL import (
+    Image, ImageOps, ImageSequence,
+    ImageFile, UnidentifiedImageError,
+)
 import numpy as np
 
 import folder_paths
 from aiohttp import web
 from server import PromptServer
+
+def _pillow(fn, arg):
+    prev_value = None
+    try:
+        x = fn(arg)
+    except (OSError, UnidentifiedImageError, ValueError):
+        # PIL issues #4472 and #2445, also fixes ComfyUI issue #3416
+        prev_value = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        x = fn(arg)
+    finally:
+        if prev_value is not None:
+            ImageFile.LOAD_TRUNCATED_IMAGES = prev_value
+    return x
+
+def _pil_to_image_mask(
+    img: 'Image.Image | Iterable[Image.Image]',
+    output_image: 'list[torch.Tensor] | None',
+    output_mask: 'list[torch.Tensor] | None'
+):
+    output_images = []
+    output_masks = []
+    w, h = None, None
+
+    excluded_formats = ['MPO']
+
+    if not isinstance(img, Iterable):
+        if img.format not in excluded_formats:
+            img = ImageSequence.Iterator(img)
+        else:
+            img = [img]
+    
+    for i in img:
+        i: Image.Image
+        i = _pillow(ImageOps.exif_transpose, i)
+
+        if i.mode == 'I':
+            i = i.point(lambda i: i * (1 / 255))
+        
+        if len(output_images) == 0 and len(output_masks) == 0:
+            w = i.size[0]
+            h = i.size[1]
+        elif i.size[0] != w or i.size[1] != h:
+            continue
+
+        if output_image is not None:
+            image = i.convert("RGB")
+
+            image = np.array(image).astype(np.float32) / 255.0
+            image = torch.from_numpy(image)[None,]
+            output_images.append(image)
+        
+        if output_mask is not None:
+            if 'A' in i.getbands():
+                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(mask)
+            elif i.mode == 'P' and 'transparency' in i.info:
+                # https://github.com/comfyanonymous/ComfyUI/pull/7539
+                mask = np.array(i.convert('RGBA').getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(mask)
+            else:
+                mask = torch.zeros((64,64), dtype=torch.float32, device="cpu")
+            # (H, W) -> (1, H, W)
+            mask = mask.unsqueeze(0)
+            output_masks.append(mask)
+
+    if len(output_images) > 1:
+        if output_image is not None:
+            output_image[:] = [torch.cat(output_images, dim=0)]
+        if output_mask is not None:
+            output_mask[:] = [torch.cat(output_masks, dim=0)]
+    else:
+        if output_image is not None:
+            output_image[:] = [output_images[0]]
+        if output_mask is not None:
+            output_mask[:] = [output_masks[0]]
 
 # ===================================================================================
 # ORIGINAL VERSION OF THE NODE
@@ -32,17 +111,12 @@ class LoadImageFromPath:
     def load_image(self, image):
         image_path = LoadImageFromPath._resolve_path(image)
 
-        i = Image.open(image_path)
-        i = ImageOps.exif_transpose(i)
-        image = i.convert("RGB")
-        image = np.array(image).astype(np.float32) / 255.0
-        image = torch.from_numpy(image)[None,]
-        if 'A' in i.getbands():
-            mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
-            mask = 1. - torch.from_numpy(mask)
-        else:
-            mask = torch.zeros((64,64), dtype=torch.float32, device="cpu")
-        return (image, mask)
+        i = _pillow(Image.open, image_path)
+
+        image = []
+        mask = []
+        _pil_to_image_mask(i, image, mask)
+        return (image[0], mask[0])
 
     def _resolve_path(image) -> Path:
         image_path = Path(folder_paths.get_annotated_filepath(image))
@@ -80,7 +154,9 @@ class PILToImage:
 
     CATEGORY = 'image/PIL'
 
-    def pil_images_to_images(self, images: Iterable[Image.Image]) -> torch.Tensor:
+    def pil_images_to_images(self, images: Iterable[Image.Image]) -> tuple[torch.Tensor]:
+        '''
+        ```
         pil_images = images
 
         images = []
@@ -100,6 +176,11 @@ class PILToImage:
             images = images[0]
 
         return (images,)
+        ```
+        '''
+        image = []
+        _pil_to_image_mask(images, image, None)
+        return (image[0],)
 
 class PILToMask:
     @classmethod
@@ -113,7 +194,9 @@ class PILToMask:
 
     CATEGORY = 'image/PIL'
 
-    def pil_images_to_masks(self, images: Iterable[Image.Image]) -> torch.Tensor:
+    def pil_images_to_masks(self, images: Iterable[Image.Image]) -> tuple[torch.Tensor]:
+        '''
+        ```
         pil_images = images
 
         masks = []
@@ -135,6 +218,11 @@ class PILToMask:
             masks = masks[0]
 
         return (masks,)
+        ```
+        '''
+        mask = []
+        _pil_to_image_mask(images, None, mask)
+        return (mask[0],)
 
 class ImageToPIL:
     @classmethod
@@ -335,8 +423,8 @@ async def get_image_preview(request):
         if not image_path or not os.path.exists(image_path):
             return web.json_response({'error': 'Invalid image path'}, status=400)
         
-        img = Image.open(image_path)
-        img = ImageOps.exif_transpose(img)
+        img = _pillow(Image.open, image_path)
+        img = _pillow(ImageOps.exif_transpose, img)
         
         max_size = (512, 512)
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
