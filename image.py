@@ -180,18 +180,29 @@ class LoadImageFromPathEnhanced(LoadImageFromPath):
     def load_image_enhanced(self, image):
         # Get the full path
         image_path = LoadImageFromPath._resolve_path(image)
+
+        i = Image.open(image_path)
+        i = ImageOps.exif_transpose(i)
+        image_tensor = i.convert("RGB")
+        image_tensor = np.array(image_tensor).astype(np.float32) / 255.0
+        image_tensor = torch.from_numpy(image_tensor)[None,]  # (1, H, W, 3)
         
-        # Call the parent class's load_image method
-        image_tensor, mask = super().load_image(image)
+        if 'A' in i.getbands():
+            mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+            mask = 1. - torch.from_numpy(mask)
+            # Add batch dimension to match ComfyUI standard
+            mask = mask.unsqueeze(0)  # (H, W) -> (1, H, W)
+        else:
+            # Add batch dimension here too
+            mask = torch.zeros((1, 64, 64), dtype=torch.float32, device="cpu")
         
         # Register this image in our cache for mask editor support
         filename = os.path.basename(str(image_path))
         _image_path_cache[filename] = str(image_path)
         _image_path_cache[str(image_path)] = str(image_path)
         
-        # Return image, mask, AND the original input path string
         return (image_tensor, mask, image)
-
+        
 # Middleware to handle clipspace file resolution
 @web.middleware
 async def clipspace_resolver_middleware(request, handler):
